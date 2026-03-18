@@ -130,14 +130,22 @@ When a customer ticket is analyzed, the system finds the best KB content through
 
 ```mermaid
 flowchart TD
-    A["🎫 New ticket arrives\n(subject + body)"] --> B["Phase 1: AI classifies ticket\ninto a category + generates\n1-3 clean search queries"]
+    A["🎫 New ticket arrives\n(subject + body)"] --> PAR
 
-    B --> MQ["📝 Search Queries\n(reformulated by AI)\nStripped of emotion,\ntypos fixed, canonical terms"]
+    subgraph PAR["⚡ Parallel: Phase 1 + Zendesk Fetch"]
+        direction LR
+        B["Phase 1: AI classifies ticket\ninto a category + generates\n1-3 clean search queries"]
+        ZF["Zendesk comment fetch\n(last 20 comments)\nruns concurrently"]
+    end
 
-    MQ --> LOOP["For each query\n(up to 3):"]
+    PAR --> MQ["📝 Search Queries\n(reformulated by AI)\nStripped of emotion,\ntypos fixed, canonical terms"]
+
+    MQ --> BATCH["⚡ Batch Embeddings\n(all queries embedded\nin parallel via\nThreadPoolExecutor)"]
+
+    BATCH --> LOOP["For each query\n(up to 3):"]
 
     LOOP --> KW["🔤 Keyword Scoring\n(always runs, <1ms)"]
-    LOOP --> VS["🧠 Vector Search\n(Bedrock + pgvector)"]
+    LOOP --> VS["🧠 Vector Search\n(uses pre-computed embedding)"]
 
     subgraph keyword["Keyword Scoring"]
         KW --> KW1["Tokenize query text\n(stopwords removed)"]
@@ -147,7 +155,7 @@ flowchart TD
 
     subgraph vector["Vector Search"]
         VS --> PUB["Filter: JOIN kb_articles\nwhere isPublished = true\n(unpublished excluded)"]
-        PUB --> VS1["Generate embedding\nvia AWS Bedrock Titan v2"]
+        PUB --> VS1["Use pre-computed embedding\n(batch generated in parallel\nbefore per-query loop)"]
         VS1 --> VS2{"Search pgvector\nfiltered by category\n+ source type"}
         VS2 -->|"3+ results"| VS3["De-duplicate\n(best chunk per source)"]
         VS2 -->|"< 3 results"| VS4["Retry without\ncategory filter"]
@@ -175,9 +183,11 @@ flowchart TD
 
     AI --> FB["📊 Retrieval Feedback Log\nsearchQueries, articlesRetrieved,\nretrievalRank, outcome"]
 
-    style A fill:#fef3c7,stroke:#f59e0b
+    style PAR fill:#fff7ed,stroke:#f97316,stroke-width:2px
     style B fill:#dbeafe,stroke:#3b82f6
+    style ZF fill:#fef3c7,stroke:#f59e0b
     style MQ fill:#e0f2fe,stroke:#0ea5e9
+    style BATCH fill:#fff7ed,stroke:#f97316
     style RRF fill:#fce7f3,stroke:#ec4899
     style RERANK fill:#fef3c7,stroke:#f59e0b
     style KWONLY fill:#fef3c7,stroke:#f59e0b
@@ -213,7 +223,7 @@ flowchart LR
     style after fill:#d1fae5,stroke:#10b981,stroke-width:1px
 ```
 
-Each query runs keyword + vector search independently. All ranked lists are fused through RRF, so multi-issue tickets find articles for **each** issue rather than a blended mess.
+Each query runs keyword + vector search independently. All query embeddings are generated in parallel via `generate_embeddings_batch()` before the per-query loop, avoiding sequential Bedrock calls. All ranked lists are fused through RRF, so multi-issue tickets find articles for **each** issue rather than a blended mess.
 
 ---
 
@@ -237,9 +247,10 @@ flowchart LR
 | Detail | Value |
 |--------|-------|
 | **Trigger** | `ENABLE_LLM_RERANK=true` env var |
+| **Model** | Claude Haiku 4.5 (fast, sufficient for simple reranking) |
 | **Min candidates** | >3 (skip if too few) |
-| **Token budget** | ~1,650 tokens (~$0.005/call) |
-| **Latency** | ~500-800ms |
+| **Token budget** | max_tokens=256, ~$0.001/call |
+| **Latency** | ~100-200ms |
 | **Fallback** | Any failure → keep RRF order |
 
 ---
@@ -381,6 +392,7 @@ Existing embeddings get enriched metadata on next re-embed (any article edit tri
 | **Stopwords** | ~60 English words | Removed from tokenization to improve keyword signal |
 | **Max results** | 10 | How many KB pieces are sent to the AI per ticket |
 | **Index type** | HNSW | Fast approximate search that scales to large datasets |
-| **LLM reranker** | Off by default (`ENABLE_LLM_RERANK=true` to enable) | Cross-encoder style relevance reranking |
+| **LLM reranker** | Off by default (`ENABLE_LLM_RERANK=true` to enable), uses Haiku 4.5 | Cross-encoder style relevance reranking (~100-200ms) |
+| **Batch embeddings** | `generate_embeddings_batch()` via ThreadPoolExecutor | All query embeddings computed in parallel before search loop |
 | **Feedback tracking** | `kb_retrieval_logs` table | Tracks search queries, retrieved articles, and outcome |
 | **Fallback chain** | Keyword-only → category filter | Graceful degradation if vector search unavailable |
