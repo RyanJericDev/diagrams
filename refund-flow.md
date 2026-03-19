@@ -40,17 +40,46 @@ flowchart TD
     H -- "Yes" --> I{"Speed check:\n3+ refunds in the\nlast minute?"}
     I -- "Yes — too fast" --> J["PAUSED\nStays as Approved\n\nCan be retried\nafter a short wait"]
 
-    I -- "No" --> K["Process refund\nthrough BigCommerce"]
+    I -- "No" --> K1["Step 1: Refund via\nCheckoutChamp\n(payment processor)"]
 
-    K --> L{"Did it succeed?"}
-    L -- "Yes" --> M["DONE\nRefund complete\nCustomer gets their money back"]
-    L -- "No" --> N["FAILED\nError is logged\nItem marked as failed"]
+    K1 --> K1Check{"Did CheckoutChamp\nsucceed?"}
+    K1Check -- "No" --> N["FAILED\nError is logged\nItem marked as failed"]
+    K1Check -- "Yes" --> K2["Step 2: Record refund\nin BigCommerce"]
+
+    K2 --> K2Check{"Did BigCommerce\nsucceed?"}
+    K2Check -- "No" --> N2["FAILED\nCC refund already processed!\nFlagged in error for operator"]
+    K2Check -- "Yes" --> K3["Step 3: Update BC\norder status\n(Refunded/Partially Refunded)"]
+
+    K3 --> M["DONE\nRefund complete\nCustomer gets their money back"]
 
     style E fill:#f59e0b,stroke:#d97706,color:#000
     style J fill:#60a5fa,stroke:#3b82f6,color:#000
     style M fill:#34d399,stroke:#10b981,color:#000
     style N fill:#f87171,stroke:#ef4444,color:#000
+    style N2 fill:#f87171,stroke:#ef4444,color:#000
 ```
+
+## Three-Step Refund Execution
+
+Refunds are processed through two external systems in sequence:
+
+| Step | System | What Happens | If It Fails |
+|------|--------|-------------|-------------|
+| 1 | **CheckoutChamp** | Actual payment refund via `POST /order/refund/` | Execution stops — no BigCommerce changes |
+| 2 | **BigCommerce** | Records the refund via payment_actions/refunds API | CC refund already processed — flagged in error result (`checkoutchampRefundCompleted: true`) |
+| 3 | **BigCommerce** | Updates order status to Refunded (4) or Partially Refunded (14) | Warning logged, non-fatal — refund is still complete |
+
+**Why CheckoutChamp first?** CheckoutChamp is the actual payment processor. BigCommerce only tracks the refund in its system. If we refunded on BC first without CC, the customer would never actually receive their money.
+
+**Partial failure handling:** If Step 1 succeeds but Step 2 fails, the error result includes `checkoutchampRefundCompleted: true` and the CC response, so operators know the customer was already refunded even though the queue item shows "failed."
+
+### Write Override Guards
+
+All three steps are protected by system override kill switches:
+- **CheckoutChamp**: `checkoutchampWriteBlocked` (checked via `assert_checkoutchamp_write_allowed()`)
+- **BigCommerce**: `bigcommerceWriteBlocked` (checked via `assert_bigcommerce_write_allowed()`)
+
+Both must be unblocked for refunds to execute.
 
 ## What Each Status Means
 
