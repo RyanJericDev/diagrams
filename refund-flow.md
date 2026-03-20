@@ -59,13 +59,22 @@ flowchart TD
     style N2 fill:#f87171,stroke:#ef4444,color:#000
 ```
 
+## CheckoutChamp Order ID Resolution
+
+Refunds require the **CheckoutChamp order ID** (`external_id`), not the BigCommerce order ID. This is stored in the `orders.external_id` column.
+
+- During ticket sync, `external_id` is pulled from BigCommerce's `external_id` field and saved to the local DB
+- If `external_id` is NULL at refund time (e.g., for orders ingested before this feature), the system **fetches it on-demand** from BigCommerce and caches it in the DB for future use
+- If BigCommerce has no `external_id` for the order, the refund fails with a clear error
+
 ## Three-Step Refund Execution
 
 Refunds are processed through two external systems in sequence:
 
 | Step | System | What Happens | If It Fails |
 |------|--------|-------------|-------------|
-| 1 | **CheckoutChamp** | Actual payment refund via `POST /order/refund/` | Execution stops — no BigCommerce changes |
+| 0 | **Resolve** | Look up CheckoutChamp order ID (`external_id`) — fetch from BigCommerce if not cached | Execution stops — no refund attempted |
+| 1 | **CheckoutChamp** | Actual payment refund via `POST /order/refund/` using `external_id` | Execution stops — no BigCommerce changes |
 | 2 | **BigCommerce** | Records the refund via payment_actions/refunds API | CC refund already processed — flagged in error result (`checkoutchampRefundCompleted: true`) |
 | 3 | **BigCommerce** | Updates order status to Refunded (4) or Partially Refunded (14) | Warning logged, non-fatal — refund is still complete |
 
